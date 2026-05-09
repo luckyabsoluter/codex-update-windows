@@ -1,4 +1,4 @@
-name: Reproduce Codex TUI self-update EPERM on Windows
+name: Reproduce Codex self-update EPERM on Windows
 
 on:
   workflow_dispatch:
@@ -14,9 +14,8 @@ jobs:
           node --version
           npm --version
           whoami
-          $PSVersionTable
 
-      - name: Install old Codex 0.128.0
+      - name: Install Codex 0.128.0
         shell: pwsh
         run: |
           npm install -g @openai/codex@0.128.0
@@ -24,127 +23,11 @@ jobs:
           npm root -g
           Get-Command codex | Format-List *
 
-      - name: Create PTY driver
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force .github/repro | Out-Null
-
-          @'
-          const pty = require("node-pty");
-          const fs = require("fs");
-
-          const logPath = process.env.CODEX_TUI_LOG || "codex-tui.log";
-
-          function log(s) {
-            fs.appendFileSync(logPath, s);
-            process.stdout.write(s);
-          }
-
-          const shell = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
-
-          const child = pty.spawn(shell, ["/d", "/s", "/c", "codex"], {
-            name: "xterm-256color",
-            cols: 140,
-            rows: 40,
-            cwd: process.cwd(),
-            env: {
-              ...process.env,
-              TERM: "xterm-256color",
-              CI: "0",
-              FORCE_COLOR: "1",
-            },
-          });
-
-          let buf = "";
-          let sentUpdateKey = false;
-          let sentConfirm = false;
-
-          child.onData((data) => {
-            log(data);
-            buf += data;
-
-            // Keep buffer bounded.
-            if (buf.length > 20000) buf = buf.slice(-20000);
-
-            const lower = buf.toLowerCase();
-
-            // Case 1: TUI shows an update banner/menu and asks to update.
-            // Adjust keys here after seeing the exact TUI text in logs.
-            if (!sentUpdateKey && (
-              lower.includes("update available") ||
-              lower.includes("new version") ||
-              lower.includes("update codex") ||
-              lower.includes("press enter to update") ||
-              lower.includes("restart codex")
-            )) {
-              sentUpdateKey = true;
-              log("\n\n[driver] update prompt detected; sending Enter\n\n");
-              child.write("\r");
-            }
-
-            // Case 2: npm/update subprocess asks for confirmation.
-            if (!sentConfirm && (
-              lower.includes("continue?") ||
-              lower.includes("confirm") ||
-              lower.includes("[y/n]") ||
-              lower.includes("(y/n)")
-            )) {
-              sentConfirm = true;
-              log("\n\n[driver] confirmation prompt detected; sending y\n\n");
-              child.write("y\r");
-            }
-
-            // Repro signal.
-            if (
-              lower.includes("eperm") ||
-              lower.includes("operation not permitted") ||
-              lower.includes("failed to remove some directories") ||
-              lower.includes("unlink") && lower.includes("codex.exe")
-            ) {
-              log("\n\n[driver] probable repro detected\n\n");
-              setTimeout(() => {
-                child.write("\x03");
-                process.exit(2);
-              }, 1000);
-            }
-          });
-
-          child.onExit(({ exitCode, signal }) => {
-            log(`\n[driver] codex exited: code=${exitCode} signal=${signal}\n`);
-            process.exit(exitCode ?? 0);
-          });
-
-          // Give the TUI time to show the update prompt.
-          setTimeout(() => {
-            log("\n\n[driver] timeout; sending Ctrl+C\n\n");
-            child.write("\x03");
-            setTimeout(() => process.exit(0), 1000);
-          }, 120000);
-          '@ | Set-Content .github/repro/drive-codex-tui.js -Encoding UTF8
-
-      - name: Install PTY dependency
-        shell: pwsh
-        run: |
-          npm init -y
-          npm install node-pty
-
-      - name: Run Codex TUI and trigger update
+      - name: Run Codex self-update
         shell: pwsh
         continue-on-error: true
-        env:
-          CODEX_TUI_LOG: codex-tui.log
         run: |
-          node .github/repro/drive-codex-tui.js
-
-      - name: Print TUI log
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path codex-tui.log) {
-            Get-Content codex-tui.log -Raw
-          } else {
-            Write-Host "No codex-tui.log found"
-          }
+          codex update
 
       - name: Print npm logs
         if: always()
