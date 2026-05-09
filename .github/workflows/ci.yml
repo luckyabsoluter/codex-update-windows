@@ -1,6 +1,7 @@
 name: Reproduce Codex self-update EPERM on Windows
 
 on:
+  push:
   workflow_dispatch:
 
 jobs:
