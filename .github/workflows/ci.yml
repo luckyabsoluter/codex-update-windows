@@ -1,4 +1,4 @@
-name: Reproduce Codex npm update EPERM on Windows
+name: Reproduce Codex TUI self-update EPERM on Windows
 
 on:
   workflow_dispatch:
@@ -16,103 +16,161 @@ jobs:
           whoami
           $PSVersionTable
 
-      - name: Install Codex globally
+      - name: Install old Codex 0.128.0
         shell: pwsh
         run: |
-          npm install -g @openai/codex
-          npm root -g
-          npm bin -g
+          npm install -g @openai/codex@0.128.0
           codex --version
+          npm root -g
+          Get-Command codex | Format-List *
 
-      - name: Locate codex.exe
-        id: locate
+      - name: Create PTY driver
         shell: pwsh
         run: |
-          $cmd = Get-Command codex -ErrorAction Stop
-          Write-Host "codex command: $($cmd.Source)"
+          New-Item -ItemType Directory -Force .github/repro | Out-Null
 
-          $globalRoot = npm root -g
-          Write-Host "npm global root: $globalRoot"
+          @'
+          const pty = require("node-pty");
+          const fs = require("fs");
 
-          $exe = Get-ChildItem $globalRoot -Recurse -Filter codex.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1 -ExpandProperty FullName
+          const logPath = process.env.CODEX_TUI_LOG || "codex-tui.log";
 
-          if (-not $exe) {
-            throw "Could not find codex.exe under npm global root"
+          function log(s) {
+            fs.appendFileSync(logPath, s);
+            process.stdout.write(s);
           }
 
-          Write-Host "Found codex.exe: $exe"
-          "CODEX_EXE=$exe" >> $env:GITHUB_ENV
+          const shell = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
 
-      - name: Lock codex.exe handle
-        shell: pwsh
-        run: |
-          $exe = $env:CODEX_EXE
-          Write-Host "Opening file handle on: $exe"
+          const child = pty.spawn(shell, ["/d", "/s", "/c", "codex"], {
+            name: "xterm-256color",
+            cols: 140,
+            rows: 40,
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              TERM: "xterm-256color",
+              CI: "0",
+              FORCE_COLOR: "1",
+            },
+          });
 
-          # Open codex.exe without FileShare.Delete.
-          # This simulates Windows refusing npm cleanup/unlink while the exe is held.
-          $script = @"
-          `$path = '$exe'
-          `$fs = [System.IO.File]::Open(
-            `$path,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::Read
-          )
-          Write-Host "Locked: `$path"
-          Start-Sleep -Seconds 300
-          `$fs.Dispose()
-          "@
+          let buf = "";
+          let sentUpdateKey = false;
+          let sentConfirm = false;
 
-          $lockScript = Join-Path $env:RUNNER_TEMP "lock-codex.ps1"
-          Set-Content -Path $lockScript -Value $script -Encoding UTF8
+          child.onData((data) => {
+            log(data);
+            buf += data;
 
-          Start-Process powershell `
-            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$lockScript`"" `
-            -WindowStyle Hidden
+            // Keep buffer bounded.
+            if (buf.length > 20000) buf = buf.slice(-20000);
 
-          Start-Sleep -Seconds 3
+            const lower = buf.toLowerCase();
 
-      - name: Try updating Codex while codex.exe is locked
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          npm install -g @openai/codex --foreground-scripts --loglevel verbose
-
-      - name: Try uninstalling Codex while codex.exe is locked
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          npm uninstall -g @openai/codex --foreground-scripts --loglevel verbose
-
-      - name: Show npm logs
-        if: always()
-        shell: pwsh
-        run: |
-          $logDir = Join-Path $env:LOCALAPPDATA "npm-cache\_logs"
-          Write-Host "npm log dir: $logDir"
-
-          if (Test-Path $logDir) {
-            Get-ChildItem $logDir -Filter "*.log" |
-              Sort-Object LastWriteTime -Descending |
-              Select-Object -First 5 |
-              ForEach-Object {
-                Write-Host "`n===== $($_.FullName) ====="
-                Get-Content $_.FullName -Tail 200
-              }
-          } else {
-            Write-Host "No npm logs found"
-          }
-
-      - name: Cleanup lock process
-        if: always()
-        shell: pwsh
-        run: |
-          Get-Process powershell -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -like "*powershell.exe" } |
-            ForEach-Object {
-              try {
-                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-              } catch {}
+            // Case 1: TUI shows an update banner/menu and asks to update.
+            // Adjust keys here after seeing the exact TUI text in logs.
+            if (!sentUpdateKey && (
+              lower.includes("update available") ||
+              lower.includes("new version") ||
+              lower.includes("update codex") ||
+              lower.includes("press enter to update") ||
+              lower.includes("restart codex")
+            )) {
+              sentUpdateKey = true;
+              log("\n\n[driver] update prompt detected; sending Enter\n\n");
+              child.write("\r");
             }
+
+            // Case 2: npm/update subprocess asks for confirmation.
+            if (!sentConfirm && (
+              lower.includes("continue?") ||
+              lower.includes("confirm") ||
+              lower.includes("[y/n]") ||
+              lower.includes("(y/n)")
+            )) {
+              sentConfirm = true;
+              log("\n\n[driver] confirmation prompt detected; sending y\n\n");
+              child.write("y\r");
+            }
+
+            // Repro signal.
+            if (
+              lower.includes("eperm") ||
+              lower.includes("operation not permitted") ||
+              lower.includes("failed to remove some directories") ||
+              lower.includes("unlink") && lower.includes("codex.exe")
+            ) {
+              log("\n\n[driver] probable repro detected\n\n");
+              setTimeout(() => {
+                child.write("\x03");
+                process.exit(2);
+              }, 1000);
+            }
+          });
+
+          child.onExit(({ exitCode, signal }) => {
+            log(`\n[driver] codex exited: code=${exitCode} signal=${signal}\n`);
+            process.exit(exitCode ?? 0);
+          });
+
+          // Give the TUI time to show the update prompt.
+          setTimeout(() => {
+            log("\n\n[driver] timeout; sending Ctrl+C\n\n");
+            child.write("\x03");
+            setTimeout(() => process.exit(0), 1000);
+          }, 120000);
+          '@ | Set-Content .github/repro/drive-codex-tui.js -Encoding UTF8
+
+      - name: Install PTY dependency
+        shell: pwsh
+        run: |
+          npm init -y
+          npm install node-pty
+
+      - name: Run Codex TUI and trigger update
+        shell: pwsh
+        continue-on-error: true
+        env:
+          CODEX_TUI_LOG: codex-tui.log
+        run: |
+          node .github/repro/drive-codex-tui.js
+
+      - name: Print TUI log
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path codex-tui.log) {
+            Get-Content codex-tui.log -Raw
+          } else {
+            Write-Host "No codex-tui.log found"
+          }
+
+      - name: Print npm logs
+        if: always()
+        shell: pwsh
+        run: |
+          $dirs = @(
+            "$env:LOCALAPPDATA\npm-cache\_logs",
+            "$env:APPDATA\npm-cache\_logs"
+          )
+
+          foreach ($dir in $dirs) {
+            Write-Host "Checking $dir"
+            if (Test-Path $dir) {
+              Get-ChildItem $dir -Filter "*.log" |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 10 |
+                ForEach-Object {
+                  Write-Host "`n===== $($_.FullName) ====="
+                  Get-Content $_.FullName -Tail 300
+                }
+            }
+          }
+
+      - name: Verify final Codex version
+        if: always()
+        shell: pwsh
+        run: |
+          codex --version
+          npm list -g @openai/codex
